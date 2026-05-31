@@ -10,28 +10,32 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ─── In-memory cache ────────────────────────────────────────────────────────
-// On serverless (Vercel), cold starts re-fetch from Supabase automatically.
-// On a warm instance, the cache avoids redundant DB calls.
+// ─── In-memory cache ─────────────────────────────────────────────────────────
 let cachedReferenceTexts = null;
 let cachedInvertedIndex = null;
+let cacheError = null;
 
 async function getIndexedData() {
+  // Return cached error so we can report it clearly
+  if (cacheError) throw cacheError;
+
   if (cachedReferenceTexts && cachedInvertedIndex) {
     return { referenceTexts: cachedReferenceTexts, invertedIndex: cachedInvertedIndex };
   }
 
   const rawTexts = await loadReferenceTexts();
 
-  // Preprocess each reference text
+  if (!rawTexts || rawTexts.length === 0) {
+    throw new Error('No reference texts found in Supabase. Check your table name and RLS policies.');
+  }
+
   const referenceTexts = rawTexts.map(row => ({
     filename: row.filename,
     processedText: preprocessText(row.content).join(' '),
     sourceUrl: row.source_url || 'No link available',
-    snippet: row.content.substring(0, 500),  // raw snippet for display
+    snippet: row.content.substring(0, 500),
   }));
 
-  // Build inverted index (ngram → list of filenames)
   const invertedIndex = new Map();
   for (const ref of referenceTexts) {
     const tokens = preprocessText(ref.processedText);
@@ -50,11 +54,13 @@ async function getIndexedData() {
   return { referenceTexts, invertedIndex };
 }
 
+// ─── Routes ──────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
   res.json({
     message: 'Plagiarism Detection API is running! (Node.js)',
     endpoints: {
+      health: '/health (GET)',
       preprocess: '/preprocess (POST)',
       check_plagiarism: '/check_plagiarism (POST)',
     },
@@ -62,10 +68,38 @@ app.get('/', (req, res) => {
   });
 });
 
+// Health check — also validates Supabase connectivity
+app.get('/health', async (req, res) => {
+  const checks = {
+    server: 'ok',
+    env: {
+      SUPABASE_URL: !!process.env.SUPABASE_URL,
+      SUPABASE_ANON_KEY: !!process.env.SUPABASE_ANON_KEY,
+    },
+    supabase: 'untested',
+    referenceTextsCount: 0,
+  };
+
+  try {
+    const { referenceTexts } = await getIndexedData();
+    checks.supabase = 'ok';
+    checks.referenceTextsCount = referenceTexts.length;
+    res.json(checks);
+  } catch (err) {
+    checks.supabase = 'error';
+    checks.error = err.message;
+    res.status(500).json(checks);
+  }
+});
+
 app.post('/preprocess', (req, res) => {
-  const { text = '' } = req.body;
-  const processedText = preprocessText(text);
-  res.json({ processed_text: processedText });
+  try {
+    const { text = '' } = req.body;
+    const processedText = preprocessText(text);
+    res.json({ processed_text: processedText });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/check_plagiarism', async (req, res) => {
@@ -77,21 +111,18 @@ app.post('/check_plagiarism', async (req, res) => {
 
     const { referenceTexts, invertedIndex } = await getIndexedData();
 
-    // Preprocess user text
     const userTokens = preprocessText(text);
     const userNgrams = getNgrams(userTokens, 3);
 
     const matches = [];
     const checkedFiles = new Set();
 
-    // For each user ngram, check inverted index then run KMP
     for (const userNgram of userNgrams) {
       if (invertedIndex.has(userNgram)) {
         const filenames = invertedIndex.get(userNgram);
         for (const filename of filenames) {
           if (checkedFiles.has(filename)) continue;
 
-          // Find this reference's full processed text
           const ref = referenceTexts.find(r => r.filename === filename);
           if (!ref) continue;
 
@@ -108,9 +139,6 @@ app.post('/check_plagiarism', async (req, res) => {
       }
     }
 
-    // ── Improved plagiarism % calculation ──────────────────────────────────
-    // Count unique matched ngrams vs total user ngrams (much more accurate
-    // than the original snippet-length approach in your Flask server)
     const matchedNgrams = new Set(matches.map(m => m.ngram));
     const plagiarismPercentage = userNgrams.length > 0
       ? (matchedNgrams.size / userNgrams.length) * 100
@@ -128,10 +156,10 @@ app.post('/check_plagiarism', async (req, res) => {
   }
 });
 
-// Vercel exports the app as a handler
+// ─── Export / local dev ───────────────────────────────────────────────────────
 module.exports = app;
 
-// Local dev server
 if (require.main === module) {
-  app.listen(5000, () => console.log('Server running on http://localhost:5000'));
+  const PORT = process.env.PORT || 5000;
+  app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
 }
