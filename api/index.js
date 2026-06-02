@@ -10,7 +10,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ─── In-memory cache ─────────────────────────────────────────────────────────
+// In-memory cache
 let cachedReferenceTexts = null;
 let cachedInvertedIndex = null;
 let cacheError = null;
@@ -54,7 +54,7 @@ async function getIndexedData() {
   return { referenceTexts, invertedIndex };
 }
 
-// ─── Routes ──────────────────────────────────────────────────────────────────
+// Routes
 
 app.get('/', (req, res) => {
   res.json({
@@ -68,7 +68,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// Health check — also validates Supabase connectivity
+// Health check
 app.get('/health', async (req, res) => {
   const checks = {
     server: 'ok',
@@ -115,33 +115,34 @@ app.post('/check_plagiarism', async (req, res) => {
     const userNgrams = getNgrams(userTokens, 3);
 
     const matches = [];
-    const checkedFiles = new Set();
+    const matchedNgramSet = new Set(); // track unique matched ngrams
 
     for (const userNgram of userNgrams) {
+      if (matchedNgramSet.has(userNgram)) continue; // skip duplicate ngrams in input
+
       if (invertedIndex.has(userNgram)) {
         const filenames = invertedIndex.get(userNgram);
         for (const filename of filenames) {
-          if (checkedFiles.has(filename)) continue;
-
           const ref = referenceTexts.find(r => r.filename === filename);
           if (!ref) continue;
 
           const kmpMatches = KMPSearch(ref.processedText, userNgram);
           if (kmpMatches.length > 0) {
+            matchedNgramSet.add(userNgram);
             matches.push({
               ngram: userNgram,
               reference_snippet: ref.snippet,
               link: ref.sourceUrl,
             });
+            break; 
           }
-          checkedFiles.add(filename);
         }
       }
     }
 
-    const matchedNgrams = new Set(matches.map(m => m.ngram));
-    const plagiarismPercentage = userNgrams.length > 0
-      ? (matchedNgrams.size / userNgrams.length) * 100
+    const uniqueUserNgrams = new Set(userNgrams).size;
+    const plagiarismPercentage = uniqueUserNgrams > 0
+      ? (matchedNgramSet.size / uniqueUserNgrams) * 100
       : 0;
 
     res.json({
@@ -156,7 +157,6 @@ app.post('/check_plagiarism', async (req, res) => {
   }
 });
 
-// ─── Export / local dev ───────────────────────────────────────────────────────
 module.exports = app;
 
 if (require.main === module) {
